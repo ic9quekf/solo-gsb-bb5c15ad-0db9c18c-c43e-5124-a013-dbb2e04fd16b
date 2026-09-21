@@ -14,9 +14,12 @@ from app.models import (
     PlanInitialBalancesResponse,
     SimulateRequest,
     SimulateResponse,
+    UsageReportRequest,
+    UsageReportResponse,
 )
 from app.planner import plan_initial_balances
 from app.simulation import simulate
+from app.usage_report import usage_report
 
 app = FastAPI(
     title="多层配额原子试算 API",
@@ -24,7 +27,8 @@ app = FastAPI(
         "接收若干令牌桶与带时间戳的请求序列，按时间顺序模拟连续补充；"
         "仅当请求桶链上所有桶余额充足时原子扣减，否则全部保持不变。"
         "另提供 /forecast：在不扣减状态的前提下，预测桶链首次同时满足成本所需的等待时间；"
-        "以及 /plan-initial-balances：以全部请求放行为目标，反推各桶所需的最低初始余额。"
+        "/plan-initial-balances：以全部请求放行为目标，反推各桶所需的最低初始余额；"
+        "以及 /usage-report：按定长时间窗口统计各桶放行消耗、拒绝次数与峰值占用。"
     ),
     version="1.0.0",
 )
@@ -50,6 +54,7 @@ def root():
         "simulate": "/simulate",
         "forecast": "/forecast",
         "plan_initial_balances": "/plan-initial-balances",
+        "usage_report": "/usage-report",
     }
 
 
@@ -71,3 +76,8 @@ def forecast_endpoint(payload: ForecastRequest) -> ForecastResponse:
 @app.post("/plan-initial-balances", response_model=PlanInitialBalancesResponse, tags=["planner"])
 def plan_initial_balances_endpoint(payload: SimulateRequest) -> PlanInitialBalancesResponse:
     return plan_initial_balances(payload)
+
+
+@app.post("/usage-report", response_model=UsageReportResponse, tags=["usage"])
+def usage_report_endpoint(payload: UsageReportRequest) -> UsageReportResponse:
+    return usage_report(payload)

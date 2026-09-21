@@ -11,6 +11,8 @@
 
 以及 **初始余额规划** 接口 `POST /plan-initial-balances`：请求体与 `/simulate` 相同，以**所有请求均获放行**为目标，在 `[0, capacity]` 内为每个桶反推满足其全部链上消耗的最低 `initial`（误差 ≤ 1e-6），返回各桶 `required_initial`、相对请求 `initial` 的 `delta` 以及用规划值完整回放得到的 `final_balances`；满桶起步仍不可行时返回 `reachable = false` 与按处理顺序首个无法满足的请求和桶。
 
+以及 **配额使用分析** 接口 `POST /usage-report`：在 `/simulate` 请求体上追加一个正数 `window_seconds`，对请求序列执行**与 `/simulate` 完全一致**的连续补充与链式原子判定，并按定长时间窗口统计每个桶的放行消耗（`consumed`）、拒绝次数（`rejected`）与峰值占用（`peak_occupancy`），同时给出各桶达到峰值的窗口起止时间与全局最忙窗口。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -27,6 +29,7 @@ docker compose up --build
 | 试算接口 | http://localhost:8000/simulate （POST） |
 | 预测接口 | http://localhost:8000/forecast （POST） |
 | 规划接口 | http://localhost:8000/plan-initial-balances （POST） |
+| 用量分析 | http://localhost:8000/usage-report （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -251,6 +254,135 @@ docker compose up --build
 
 - `available`：满桶起步回放中，该桶在判定时刻（补充之后、扣减之前）的余额。
 
+## 请求格式 `POST /usage-report`
+
+请求体在 `/simulate` 的 `buckets` + `requests` 之上**仅追加一个字段** `window_seconds`（桶与请求的字段、校验规则与 `/simulate` 完全一致）。接口对请求序列执行与 `/simulate` 完全相同的连续补充与链式原子判定，再按定长窗口归集用量。
+
+```json
+{
+  "window_seconds": 2,
+  "buckets": [
+    {"id": "tenant_quota", "capacity": 100, "refill_rate": 10, "initial": 100},
+    {"id": "api_qps", "capacity": 5, "refill_rate": 5},
+    {"id": "user_quota", "capacity": 20, "refill_rate": 1, "initial": 3}
+  ],
+  "requests": [
+    {"id": "req-1", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps", "user_quota"]},
+    {"id": "req-2", "timestamp": 0, "cost": 4, "chain": ["tenant_quota", "api_qps"]},
+    {"id": "req-3", "timestamp": 1, "cost": 4, "chain": ["tenant_quota", "api_qps"]},
+    {"id": "req-4", "timestamp": 2, "cost": 4, "chain": ["tenant_quota", "api_qps", "user_quota"]}
+  ]
+}
+```
+
+### 字段说明
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `window_seconds` | 是 | 统计窗口长度（秒），必须是**正数**有限数值；窗口相对时间原点对齐 |
+| `buckets` / `requests` | 是 | 与 `/simulate` 完全相同，校验规则也一致 |
+
+### 统计语义
+
+1. **同一套判定**：放行/拒绝、扣减与补充轨迹与 `/simulate` 逐请求一致（两接口共用同一模拟引擎），因此各桶的放行消耗与拒绝结果不会与试算结果出现偏差。
+2. **半开窗口**：包含时间戳 `t` 的窗口为 `[k·window_seconds, (k+1)·window_seconds)`，其中 `k = floor(t / window_seconds)`。恰好落在边界上的请求计入**右侧（较晚）**窗口；跨窗口的请求只计入其发生时刻所在窗口，不向前/后窗口分摊。负时间戳同样按时间原点对齐（如 `t=-1, window=2` 落入 `[-2, 0)`）。
+3. **空窗跳过**：没有任何请求落入的窗口不在 `windows` 中输出。
+4. **放行消耗 `consumed`**：窗口内被放行请求从该桶实际扣减的令牌总量；被原子拒绝的请求不计消耗。
+5. **拒绝次数 `rejected`**：窗口内**引用该桶且被拒绝**的请求次数——即使限制桶是链上的其他桶，该请求链上每个被触及的桶都各计一次拒绝（拒绝不扣减任何令牌）。
+6. **峰值占用 `peak_occupancy`**：窗口内各请求判定时刻的占用峰值，`占用 = capacity − 判定后余额`（拒绝时余额不变）。占用在请求时刻采样，窗口间的连续补充不产生采样；不请求触及的桶无窗口记录。
+7. **每桶峰值窗口**：`peak_window_start/end` 给出该桶达到全局峰值占用的**最早**窗口（并列取最早）；从未被引用的桶峰值为 0，峰值窗口取首个窗口。
+8. **全局最忙窗口** `busiest_window`：窗口内全部桶放行扣减之和（`total_consumed`）最大的窗口，并列取最早窗口。
+
+### 响应示例
+
+```json
+{
+  "window_seconds": 2.0,
+  "windows": [
+    {
+      "start": 0.0,
+      "end": 2.0,
+      "allowed_requests": 2,
+      "rejected_requests": 1,
+      "total_consumed": 16.0,
+      "buckets": {
+        "tenant_quota": {"consumed": 8.0, "rejected": 1, "peak_occupancy": 4.0},
+        "api_qps": {"consumed": 8.0, "rejected": 1, "peak_occupancy": 4.0},
+        "user_quota": {"consumed": 0.0, "rejected": 1, "peak_occupancy": 17.0}
+      }
+    },
+    {
+      "start": 2.0,
+      "end": 4.0,
+      "allowed_requests": 1,
+      "rejected_requests": 0,
+      "total_consumed": 12.0,
+      "buckets": {
+        "tenant_quota": {"consumed": 4.0, "rejected": 0, "peak_occupancy": 4.0},
+        "api_qps": {"consumed": 4.0, "rejected": 0, "peak_occupancy": 4.0},
+        "user_quota": {"consumed": 4.0, "rejected": 0, "peak_occupancy": 19.0}
+      }
+    }
+  ],
+  "buckets": [
+    {
+      "id": "tenant_quota",
+      "consumed_total": 12.0,
+      "rejected_total": 1,
+      "peak_occupancy": 4.0,
+      "peak_window_start": 0.0,
+      "peak_window_end": 2.0,
+      "windows": {
+        "0.0": {"consumed": 8.0, "rejected": 1, "peak_occupancy": 4.0},
+        "2.0": {"consumed": 4.0, "rejected": 0, "peak_occupancy": 4.0}
+      }
+    },
+    {
+      "id": "api_qps",
+      "consumed_total": 12.0,
+      "rejected_total": 1,
+      "peak_occupancy": 4.0,
+      "peak_window_start": 0.0,
+      "peak_window_end": 2.0,
+      "windows": {
+        "0.0": {"consumed": 8.0, "rejected": 1, "peak_occupancy": 4.0},
+        "2.0": {"consumed": 4.0, "rejected": 0, "peak_occupancy": 4.0}
+      }
+    },
+    {
+      "id": "user_quota",
+      "consumed_total": 4.0,
+      "rejected_total": 1,
+      "peak_occupancy": 19.0,
+      "peak_window_start": 2.0,
+      "peak_window_end": 4.0,
+      "windows": {
+        "0.0": {"consumed": 0.0, "rejected": 1, "peak_occupancy": 17.0},
+        "2.0": {"consumed": 4.0, "rejected": 0, "peak_occupancy": 19.0}
+      }
+    }
+  ],
+  "busiest_window": {
+    "start": 0.0,
+    "end": 2.0,
+    "allowed_requests": 2,
+    "rejected_requests": 1,
+    "total_consumed": 16.0,
+    "buckets": {
+      "tenant_quota": {"consumed": 8.0, "rejected": 1, "peak_occupancy": 4.0},
+      "api_qps": {"consumed": 8.0, "rejected": 1, "peak_occupancy": 4.0},
+      "user_quota": {"consumed": 0.0, "rejected": 1, "peak_occupancy": 17.0}
+    }
+  },
+  "allowed_count": 3,
+  "rejected_count": 1
+}
+```
+
+- `windows[]`：含至少一个请求的窗口，按时间升序；`start` 含、`end` 不含；
+- `buckets[].windows`：该桶被请求触及的窗口映射，键为窗口起点（字符串），未触及的窗口不出现；
+- 本例 `req-2` 在 t=0 被 `api_qps` 原子拒绝（`user_quota` 同样计 1 次拒绝但不扣减），故窗口 `[0,2)` 仅 16 个令牌放行消耗；`user_quota` 在 `[2,4)` 判定后仅剩 1 个令牌，峰值占用 19。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -258,9 +390,10 @@ docker compose up --build
 - **重复桶**：`buckets[].id` 重复（`duplicate_bucket`）；
 - **非法速率/容量**：`capacity <= 0`、`refill_rate < 0`、非有限数值、`initial`/`balance` 越界；
 - **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
-- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate`）、多余字段（`extra="forbid"`）。
+- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 及其同构请求体 `/plan-initial-balances`、`/usage-report`）、多余字段（`extra="forbid"`）；
+- `/usage-report` 额外要求 `window_seconds` 为正数有限数值，否则返回定位到 `window_seconds` 的结构化错误。
 
-以上规则对 `/simulate`、`/forecast` 与 `/plan-initial-balances` 同时生效（按各自字段；`/plan-initial-balances` 与 `/simulate` 共用同一套请求模型）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances` 与 `/usage-report` 同时生效（按各自字段；`/plan-initial-balances` 与 `/usage-report` 均复用 `/simulate` 的请求模型）。
 
 ## 本地调用示例
 
@@ -276,6 +409,10 @@ curl -X POST http://localhost:8000/forecast \
 curl -X POST http://localhost:8000/plan-initial-balances \
   -H 'Content-Type: application/json' \
   -d @examples/plan-initial-balances.json
+
+curl -X POST http://localhost:8000/usage-report \
+  -H 'Content-Type: application/json' \
+  -d @examples/usage-report.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -299,14 +436,16 @@ pytest -q
 ├── app/
 │   ├── main.py          # FastAPI 路由与异常处理
 │   ├── models.py        # Pydantic 模型与输入校验
-│   ├── simulation.py    # 连续补充 + 原子扣减模拟引擎
+│   ├── simulation.py    # 连续补充 + 原子扣减模拟引擎（/simulate 与 /usage-report 共用）
 │   ├── forecast.py      # 等待时间预测引擎（不扣减状态）
 │   ├── planner.py       # 初始余额规划引擎（反推最低 initial）
+│   ├── usage_report.py  # 分窗口配额使用分析（放行消耗/拒绝次数/峰值占用/最忙窗口）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
 ├── examples/forecast.json
 ├── examples/plan-initial-balances.json
+├── examples/usage-report.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口

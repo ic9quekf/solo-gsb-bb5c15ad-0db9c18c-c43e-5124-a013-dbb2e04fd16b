@@ -380,3 +380,89 @@ class PlanInitialBalancesResponse(BaseModel):
         PlanFailure | None,
         Field(description="不可行时按处理顺序首个无法满足的请求与桶；可行时为 null"),
     ]
+
+
+class UsageReportRequest(SimulateRequest):
+    """POST /usage-report 请求体：在 /simulate 请求体上追加统计窗口长度。"""
+
+    window_seconds: Annotated[
+        float,
+        Field(description="统计窗口长度（秒），必须为正数；窗口相对时间原点半开对齐"),
+    ]
+
+    @field_validator("window_seconds", mode="before")
+    @classmethod
+    def _validate_window_seconds(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("window_seconds 必须是有限数值")
+        if value <= 0:
+            raise ValueError("window_seconds 必须为正数")
+        return value
+
+
+class BucketWindowUsage(BaseModel):
+    """单个桶在某个窗口内的配额使用情况。"""
+
+    consumed: Annotated[
+        float, Field(description="窗口内被放行请求从该桶扣减的令牌总量")
+    ]
+    rejected: Annotated[
+        int, Field(description="窗口内引用该桶且被原子拒绝的请求次数（不区分限制桶）")
+    ]
+    peak_occupancy: Annotated[
+        float,
+        Field(description="窗口内判定时刻的峰值占用 = capacity − 判定后余额的最大值"),
+    ]
+
+
+class BucketUsage(BaseModel):
+    """单个桶跨全部窗口的配额使用汇总。"""
+
+    id: str
+    consumed_total: Annotated[float, Field(description="全部窗口放行扣减总量")]
+    rejected_total: Annotated[int, Field(description="全部窗口内引用该桶的拒绝次数")]
+    peak_occupancy: Annotated[float, Field(description="全部窗口内的峰值占用")]
+    peak_window_start: Annotated[
+        float, Field(description="达到峰值占用的最早窗口起点（半开区间起点）")
+    ]
+    peak_window_end: Annotated[
+        float, Field(description="达到峰值占用的最早窗口终点（半开区间终点，不含）")
+    ]
+    windows: Annotated[
+        dict[str, BucketWindowUsage],
+        Field(description="按窗口起点索引的分窗使用情况；仅含该桶被请求触及的窗口"),
+    ]
+
+
+class WindowSummary(BaseModel):
+    """一个窗口（含至少一个请求）的全局汇总。"""
+
+    start: Annotated[float, Field(description="窗口起点（半开区间，含）")]
+    end: Annotated[float, Field(description="窗口终点（半开区间，不含）")]
+    allowed_requests: Annotated[int, Field(description="窗口内放行请求数")]
+    rejected_requests: Annotated[int, Field(description="窗口内拒绝请求数")]
+    total_consumed: Annotated[
+        float,
+        Field(description="窗口内全部桶放行扣减令牌之和（= 放行请求数 × 各请求链长度按桶归集）"),
+    ]
+    buckets: Annotated[
+        dict[str, BucketWindowUsage],
+        Field(description="窗口内各被触及桶的使用情况，键为桶 ID"),
+    ]
+
+
+class UsageReportResponse(BaseModel):
+    window_seconds: Annotated[float, Field(description="实际使用的统计窗口长度（秒）")]
+    windows: Annotated[
+        list[WindowSummary],
+        Field(description="含至少一个请求的窗口，按时间升序（跳过中间空窗）"),
+    ]
+    buckets: Annotated[
+        list[BucketUsage], Field(description="各桶使用汇总，按 buckets 输入顺序")
+    ]
+    busiest_window: Annotated[
+        WindowSummary,
+        Field(description="全局最忙窗口：放行扣减总量最大，并列取最早窗口"),
+    ]
+    allowed_count: int
+    rejected_count: int

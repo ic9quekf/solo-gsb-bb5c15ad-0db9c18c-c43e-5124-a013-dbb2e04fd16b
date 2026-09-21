@@ -1,7 +1,9 @@
 """核心模拟引擎：连续补充 + 链上原子扣减。"""
 from __future__ import annotations
 
-from app.models import EPS, SimulateRequest, SimulateResponse, SimResult, BucketBalance
+from dataclasses import dataclass
+
+from app.models import EPS, BucketBalance, SimulateRequest, SimulateResponse, SimResult
 
 # 输出精度，避免二进制浮点产生的长尾数
 _ROUND_DIGITS = 9
@@ -13,7 +15,46 @@ def _round(value: float) -> float:
     return rounded if rounded != 0 else 0.0
 
 
-def simulate(payload: SimulateRequest) -> SimulateResponse:
+@dataclass(frozen=True)
+class BucketEvent:
+    """单次请求判定时，链上某个桶的原始状态。
+
+    before/after 均为未舍入的内部精度：拒绝时 after == before（原子性）。
+    """
+
+    bucket_id: str
+    before: float
+    after: float
+
+
+@dataclass(frozen=True)
+class RequestEvent:
+    """单次请求按时间顺序处理后的判定结果（原始下标，非处理顺序）。"""
+
+    index: int
+    request_id: str
+    timestamp: float
+    allowed: bool
+    rejected_by: str | None
+    buckets: tuple[BucketEvent, ...]
+
+
+@dataclass(frozen=True)
+class EngineRun:
+    """模拟引擎一次完整运行的原始轨迹。"""
+
+    events: tuple[RequestEvent, ...]  # 按处理顺序（时间升序、同刻按输入顺序）
+    final_balances: dict[str, float]
+    t_start: float
+    t_end: float
+
+
+def run_engine(payload: SimulateRequest) -> EngineRun:
+    """执行连续补充 + 链上原子扣减，返回未舍入的逐事件轨迹。
+
+    /simulate 与 /usage-report 共用此核心，保证两者对同一请求序列的
+    连续补充与原子判定完全一致。
+    """
     if not payload.buckets:
         raise ValueError("buckets 不能为空")
     if not payload.requests:
@@ -48,7 +89,7 @@ def simulate(payload: SimulateRequest) -> SimulateResponse:
         key=lambda i: (payload.requests[i].timestamp, i),
     )
 
-    results_by_index: dict[int, SimResult] = {}
+    events: list[RequestEvent] = []
 
     for i in order:
         request = payload.requests[i]
@@ -65,7 +106,7 @@ def simulate(payload: SimulateRequest) -> SimulateResponse:
                 break
 
         allowed = rejected_by is None
-        balances_view: dict[str, BucketBalance] = {}
+        bucket_events: list[BucketEvent] = []
 
         for bucket_id in request.chain:
             before = refilled[bucket_id]
@@ -75,30 +116,55 @@ def simulate(payload: SimulateRequest) -> SimulateResponse:
             else:
                 # 原子性：拒绝时链上所有桶保持不变
                 after = before
-            balances_view[bucket_id] = BucketBalance(
-                before=_round(before), after=_round(after)
-            )
+            bucket_events.append(BucketEvent(bucket_id=bucket_id, before=before, after=after))
 
-        results_by_index[i] = SimResult(
-            request_id=request.id,
-            index=i,
-            timestamp=_round(now),
-            allowed=allowed,
-            rejected_by=rejected_by,
-            balances=balances_view,
+        events.append(
+            RequestEvent(
+                index=i,
+                request_id=request.id,
+                timestamp=now,
+                allowed=allowed,
+                rejected_by=rejected_by,
+                buckets=tuple(bucket_events),
+            )
         )
 
     # 把所有未再参与请求的桶补充到最后时刻，给出终态余额
     final_balances = {
-        bucket_id: _round(
-            min(
-                capacity[bucket_id],
-                balance[bucket_id]
-                + refill_rate[bucket_id] * max(0.0, t_end - last_time[bucket_id]),
-            )
+        bucket_id: min(
+            capacity[bucket_id],
+            balance[bucket_id]
+            + refill_rate[bucket_id] * max(0.0, t_end - last_time[bucket_id]),
         )
         for bucket_id in balance
     }
+
+    return EngineRun(
+        events=tuple(events),
+        final_balances=final_balances,
+        t_start=t_start,
+        t_end=t_end,
+    )
+
+
+def simulate(payload: SimulateRequest) -> SimulateResponse:
+    """按时间顺序模拟，返回逐项扣减视图（results 按原始数组顺序）。"""
+    run = run_engine(payload)
+
+    results_by_index: dict[int, SimResult] = {}
+    for event in run.events:
+        balances_view = {
+            be.bucket_id: BucketBalance(before=_round(be.before), after=_round(be.after))
+            for be in event.buckets
+        }
+        results_by_index[event.index] = SimResult(
+            request_id=event.request_id,
+            index=event.index,
+            timestamp=_round(event.timestamp),
+            allowed=event.allowed,
+            rejected_by=event.rejected_by,
+            balances=balances_view,
+        )
 
     results = [results_by_index[i] for i in range(len(payload.requests))]
     allowed_count = sum(1 for r in results if r.allowed)
@@ -107,5 +173,7 @@ def simulate(payload: SimulateRequest) -> SimulateResponse:
         allowed_count=allowed_count,
         rejected_count=len(results) - allowed_count,
         results=results,
-        final_balances=final_balances,
+        final_balances={
+            bucket_id: _round(value) for bucket_id, value in run.final_balances.items()
+        },
     )
